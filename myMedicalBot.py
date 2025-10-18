@@ -1,118 +1,192 @@
 import os
-import pickle
 import time
+import uuid
+from pathlib import Path
 
 import requests
-from dotenv import load_dotenv
-from langchain_community.document_loaders import UnstructuredPDFLoader
-
-load_dotenv()
-from langchain.document_loaders import DirectoryLoader,PyPDFLoader
-from langchain.text_splitter import  RecursiveCharacterTextSplitter
-from langchain.embeddings import OllamaEmbeddings
-import uuid
 import streamlit as st
+from dotenv import load_dotenv
+
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import OllamaEmbeddings
 from langchain_community.vectorstores import FAISS
-## Design the bot screen -
+from langchain_community.document_loaders import DirectoryLoader, PyMuPDFLoader
+
+from langchain.llms import  Ollama
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+
+# -------------------------------------------------------
+# Load environment variables
+# -------------------------------------------------------
+load_dotenv()
+
+# -------------------------------------------------------
+# App Config
+# -------------------------------------------------------
 st.title("💬 Medical Bot")
 main_placeholder = st.empty()
-embedding_path = "medical_bot_faiss.pkl"
-### Do the pre-processing of data
-MODEL_NAME = os.getenv("MODEL_NAME","openhermes:latest")
-BASE_URL = os.getenv("BASE_URL","http://localhost:11434/")
-main_placeholder.text("✅ Loading medical encyclopedia ...")
-pdf_loader = DirectoryLoader(loader_cls=PyPDFLoader,path="data",glob="*.pdf")
-pdf_loaded_data = pdf_loader.load()
-print(f"Loaded {len(pdf_loaded_data)} elements")
-print("Sample element:", pdf_loaded_data[0].metadata.get("category"), pdf_loaded_data[0].page_content[:200], "...")
 
-main_placeholder.text(f"✅ Creating Chunks of data #{len(pdf_loaded_data)}...")
-txt_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000,
-    chunk_overlap=200,
-    separators=["\n\n", "\n", ".", ","],   # coarse → fine
-    keep_separator=False
-)
-split_docs = txt_splitter.split_documents(pdf_loaded_data)
+MODEL_NAME = os.getenv("MODEL_NAME", "nomic-embed-text:latest")
+BASE_URL = os.getenv("BASE_URL", "http://localhost:11434")
+DATA_DIR = Path("data")
+INDEX_DIR = Path("model/medical_bot_faiss")  # FAISS saves a folder, not a .pkl
+llm = Ollama(base_url=BASE_URL,model=MODEL_NAME)
 
-main_placeholder.text(f"✅ Creating Embeddings ...")
+# -------------------------------------------------------
+# Helper: check if FAISS index already exists
+# -------------------------------------------------------
+def faiss_exists(path: Path) -> bool:
+    """Return True if saved FAISS index is already available."""
+    return (path / "index.faiss").exists() and (path / "index.pkl").exists()
 
-try:
-    r = requests.get(f"{BASE_URL}/api/tags", timeout=5)
-    r.raise_for_status()
-    main_placeholder.text(f"✅ Connecting model ...")
-except Exception as e:
-    st.error(f"Cannot reach Ollama at {BASE_URL}. Start Ollama and ensure the model is pulled.\n{e}")
-    st.stop()
+# -------------------------------------------------------
+# Helper: ensure Ollama is reachable
+# -------------------------------------------------------
+def ensure_ollama_ready(base_url: str):
+    try:
+        r = requests.get(f"{base_url}/api/tags", timeout=5)
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        st.error(
+            f"❌ Cannot reach Ollama at {base_url}. Start Ollama and ensure the model is pulled.\n{e}"
+        )
+        st.stop()
 
-# --- 1) Construct embeddings (ensure strings) ---
-embeddings = OllamaEmbeddings(model=MODEL_NAME, base_url=BASE_URL)
+# -------------------------------------------------------
+# Build or load FAISS index
+# -------------------------------------------------------
+def build_or_load_index():
+    embeddings = OllamaEmbeddings(model=MODEL_NAME, base_url=BASE_URL)
 
-# --- 2) Minimal sanity embed (fast fail if model missing) ---
-try:
-    _ = embeddings.embed_query("health check")
-    main_placeholder.text(f"✅ Model connection done , checking embeddings ... ")
-except Exception as e:
-    st.error(f"Embedding model not ready (pull it with `ollama pull {MODEL_NAME}`):\n{e}")
-    st.stop()
+    if faiss_exists(INDEX_DIR):
+        main_placeholder.text("📦 Found existing FAISS index. Loading ...")
+        vs = FAISS.load_local(
+            str(INDEX_DIR),
+            embeddings,
+            allow_dangerous_deserialization=True,
+        )
+        main_placeholder.text("🟢 Index loaded successfully.")
+        return vs
 
+    # ---- Build index for the first time ----
+    main_placeholder.text("📚 No existing index found. Reading PDFs ...")
 
-embeddings = OllamaEmbeddings(model=MODEL_NAME)
-batch_size = 50
-total_docs = len(split_docs)
-progress = st.progress(0,text=f"Embeddings 0/{total_docs}")
-status = st.empty()
-ollama_embeding = None
-start = time.time()
-main_placeholder.text(f"✅ Processing embeddings ... ")
-for i in range(0,total_docs,batch_size):
-    batch = split_docs[i:i+batch_size]
-    if ollama_embeding is None:
-        ollama_embeding = FAISS.from_documents(documents=batch,embedding=embeddings)
-    else:
-        ollama_embeding.add_documents(batch,embeddings=embeddings)
-    done = min(i + batch_size, total_docs)
-    progress.progress(done / total_docs, text=f"Embedding {done} / {total_docs}")
+    if not DATA_DIR.exists():
+        st.error(f"Data folder not found: {DATA_DIR.resolve()}")
+        st.stop()
+
+    loader = DirectoryLoader(
+        path=str(DATA_DIR),
+        glob="*.pdf",
+        loader_cls=PyMuPDFLoader,  # Use PyPDFLoader if PyMuPDF unavailable
+        show_progress=True,
+    )
+    docs = loader.load()
+    if not docs:
+        st.error("No PDF files found in the /data directory.")
+        st.stop()
+
+    # ---- Chunk documents ----
+    main_placeholder.text(f"✂️ Splitting {len(docs)} documents into chunks ...")
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1500,
+        chunk_overlap=150,
+        separators=["\n\n", "\n", "."],
+        keep_separator=False,
+    )
+    chunks = splitter.split_documents(docs)
+    total_chunks = len(chunks)
+    main_placeholder.text(f"📄 Created {total_chunks} chunks. Generating embeddings ...")
+
+    # ---- Create FAISS index ----
+    batch_size = 256
+    progress = st.progress(0, text=f"Embedding 0 / {total_chunks}")
+    status = st.empty()
+    start = time.time()
+    vs = None
+    first = True
+
+    for i in range(0, total_chunks, batch_size):
+        batch = chunks[i:i + batch_size]
+        if first:
+            vs = FAISS.from_documents(batch, embeddings)
+            first = False
+        else:
+            vs.add_documents(batch, embedding=embeddings)
+        done = min(i + batch_size, total_chunks)
+        progress.progress(done / total_chunks, text=f"Embedding {done} / {total_chunks}")
 
     elapsed = time.time() - start
-    status.info(f"Embeddings complete in {elapsed:.1f}s. Saving index...")
+    status.info(f"✅ Embeddings complete in {elapsed:.1f}s. Saving index ...")
 
-    # --- 5) Save index ---
-os.makedirs(embedding_path, exist_ok=True)
-ollama_embeding.save_local(embedding_path)
-progress.empty()
-status.empty()
-main_placeholder.text("🟢 Ready !!")
+    INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    vs.save_local(str(INDEX_DIR))
+    progress.empty()
+    status.empty()
+    main_placeholder.text("🟢 Index built and saved. Future runs will reuse it.")
+    return vs
 
+# -------------------------------------------------------
+# App Startup
+# -------------------------------------------------------
+ensure_ollama_ready(BASE_URL)
+_ = OllamaEmbeddings(model=MODEL_NAME, base_url=BASE_URL).embed_query("health check")
+vectorstore = build_or_load_index()
+retriver = vectorstore.as_retriever(search_kwargs={"k":4})
+chat_template = ChatPromptTemplate.from_messages([
+    ("system","You are an expert medical assistance. Answer fro given context. Be consice and accurate."
+              "You need to understand symptoms that user is telling from context you to suggest him possible disease and remedy "),
+    ("user","Qestion : {question} \n\n"
+            "Context : {context}")
+])
 
-user_messages = [{"id": str(uuid.uuid4()),"role":"assistant","msg":"Hello , How I can help you ?"}]
+def format_doc(docs):
+    return "\n\n".join(f"[Chunk {i+1}] {d.page_content}" for i, d in enumerate(docs))
+
+rag_chain = (
+    {
+        "context": retriver | format_doc,
+        "question": RunnablePassthrough(),
+    }
+    | chat_template
+    | llm
+    | StrOutputParser()
+)
+
+# -------------------------------------------------------
+# Chat UI setup
+# -------------------------------------------------------
+user_messages = [
+    {"id": str(uuid.uuid4()), "role": "assistant", "msg": "Hello 👋, how can I help you today?"}
+]
 
 if "messages" not in st.session_state:
     st.session_state.messages = user_messages
 
-## Actions
-
 def update_chat_messages():
-    messages_from_session = st.session_state.messages
-    for message in messages_from_session:
-       with st.chat_message(message["role"]):
-           st.markdown(message["msg"])
-
-
-
-
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["msg"])
 
 update_chat_messages()
-user_message = st.chat_input("Enter your query...")
+
+# -------------------------------------------------------
+# Chat logic
+# -------------------------------------------------------
+user_message = st.chat_input("Enter your medical query...")
+
 if user_message:
-    key_id = uuid.uuid4()
-    st.session_state.messages.append({"id": str(key_id),"role":"user","msg":user_message})
+    key_id = str(uuid.uuid4())
+    st.session_state.messages.append({"id": key_id, "role": "user", "msg": user_message})
     with st.chat_message("user"):
         st.markdown(user_message)
 
-
-
-
-
-
-
+    with st.chat_message("assistant"):
+        if vectorstore is None:
+            st.error("Vector store not ready.")
+        else:
+            answer = rag_chain.invoke(user_message)
+            st.markdown(answer)
